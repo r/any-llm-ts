@@ -13,6 +13,7 @@ Inspired by [mozilla-ai/any-llm](https://github.com/mozilla-ai/any-llm).
 - 🔧 **Tool Calling** - Function/tool calling support
 - 🎯 **TypeScript** - Full type safety
 - 🔌 **Extensible** - Easy to add new providers
+- 📦 **Official SDKs** - Built on official provider SDKs for reliability
 
 ## Installation
 
@@ -268,6 +269,27 @@ try {
   }
 }
 ```
+
+## Architecture
+
+Under the hood, any-llm-ts uses the official SDKs from each provider rather than making raw HTTP calls. This provides:
+
+- **Better error handling** - SDK-specific errors are mapped to consistent any-llm-ts error types
+- **Automatic retries** - Built-in retry logic from official SDKs
+- **Type safety** - Full TypeScript support from provider SDKs
+- **API versioning** - SDKs handle API version compatibility
+- **Streaming** - Native streaming support from each SDK
+
+### SDK Dependencies
+
+| Provider | SDK Package |
+|----------|-------------|
+| OpenAI, Groq, Together, OpenRouter, DeepSeek, LM Studio | [`openai`](https://www.npmjs.com/package/openai) |
+| Anthropic | [`@anthropic-ai/sdk`](https://www.npmjs.com/package/@anthropic-ai/sdk) |
+| Ollama | [`ollama`](https://www.npmjs.com/package/ollama) |
+| Llamafile | [`openai`](https://www.npmjs.com/package/openai) (OpenAI-compatible API) |
+
+OpenAI-compatible providers (Groq, Together, OpenRouter, etc.) use the OpenAI SDK with a custom `baseURL` configuration.
 
 ## Development
 
