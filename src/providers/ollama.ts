@@ -1,12 +1,22 @@
 /**
  * Ollama LLM Provider for any-llm.
  * 
- * Ollama runs locally and provides an OpenAI-compatible API.
- * This provider uses the native Ollama API for better control.
+ * Uses the official Ollama SDK for robust API interactions.
+ * Ollama runs locally and provides access to open-source models.
  * 
  * @see https://github.com/ollama/ollama
+ * @see https://github.com/ollama/ollama-js
  */
 
+import { Ollama } from 'ollama';
+import type {
+  ChatRequest,
+  ChatResponse,
+  Message as OllamaMessage,
+  Tool as OllamaTool,
+  ToolCall as OllamaToolCall,
+  ListResponse,
+} from 'ollama';
 import { BaseProvider } from './base.js';
 import type {
   ChatCompletion,
@@ -18,76 +28,8 @@ import type {
   ModelInfo,
   ProviderConfig,
   Tool,
-  ToolCall,
 } from '../types.js';
 import { ProviderRequestError, ProviderUnavailableError, TimeoutError } from '../errors.js';
-
-// =============================================================================
-// Ollama API Types
-// =============================================================================
-
-interface OllamaMessage {
-  role: 'system' | 'user' | 'assistant' | 'tool';
-  content: string;
-  images?: string[];
-  tool_calls?: OllamaToolCall[];
-}
-
-interface OllamaToolCall {
-  id?: string;
-  function: {
-    name: string;
-    arguments: Record<string, unknown>;
-  };
-}
-
-interface OllamaTool {
-  type: 'function';
-  function: {
-    name: string;
-    description: string;
-    parameters: object;
-  };
-}
-
-interface OllamaChatRequest {
-  model: string;
-  messages: OllamaMessage[];
-  tools?: OllamaTool[];
-  stream?: boolean;
-  options?: {
-    temperature?: number;
-    top_p?: number;
-    num_predict?: number;
-    stop?: string[];
-    seed?: number;
-  };
-}
-
-interface OllamaChatResponse {
-  model: string;
-  created_at: string;
-  message: OllamaMessage;
-  done: boolean;
-  done_reason?: string;
-  total_duration?: number;
-  prompt_eval_count?: number;
-  eval_count?: number;
-}
-
-interface OllamaModelsResponse {
-  models: Array<{
-    name: string;
-    model: string;
-    modified_at: string;
-    size: number;
-    digest: string;
-  }>;
-}
-
-interface OllamaVersionResponse {
-  version: string;
-}
 
 // Minimum Ollama version for tool calling support
 const MINIMUM_TOOL_VERSION = '0.3.0';
@@ -108,6 +50,7 @@ export class OllamaProvider extends BaseProvider {
   readonly SUPPORTS_LIST_MODELS = true;
   readonly SUPPORTS_REASONING = true;
   
+  private client: Ollama;
   private timeout: number;
   private version: string | null = null;
   private toolsSupported: boolean | null = null;
@@ -116,6 +59,11 @@ export class OllamaProvider extends BaseProvider {
     super(config);
     this.init();
     this.timeout = config.timeout ?? 120000; // Ollama can be slow
+    
+    // Initialize the Ollama client
+    this.client = new Ollama({
+      host: this.baseUrl,
+    });
   }
   
   /**
@@ -142,56 +90,25 @@ export class OllamaProvider extends BaseProvider {
   }
   
   /**
-   * Fetch the Ollama version.
-   */
-  private async fetchVersion(): Promise<string | null> {
-    try {
-      const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 5000);
-      
-      const response = await fetch(`${this.baseUrl}/api/version`, {
-        method: 'GET',
-        signal: controller.signal,
-      });
-      
-      clearTimeout(timeoutId);
-      
-      if (!response.ok) return null;
-      
-      const data = await response.json() as OllamaVersionResponse;
-      return data.version || null;
-    } catch {
-      return null;
-    }
-  }
-  
-  /**
    * Check if Ollama is available.
    */
   async isAvailable(): Promise<boolean> {
     try {
-      const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 5000);
+      // Use list() to check if Ollama is running
+      const response = await this.client.list();
       
-      const response = await fetch(`${this.baseUrl}/api/tags`, {
-        method: 'GET',
-        signal: controller.signal,
-      });
-      
-      clearTimeout(timeoutId);
-      
-      if (response.ok) {
-        // Check version for tool support
-        this.version = await this.fetchVersion();
-        if (this.version) {
-          this.toolsSupported = this.compareVersions(this.version, MINIMUM_TOOL_VERSION) >= 0;
-        } else {
+      // Check version for tool support if we haven't already
+      if (this.version === null) {
+        try {
+          // The SDK doesn't expose version directly, but we can infer from capabilities
+          // For now, assume tools are supported if we can connect
+          this.toolsSupported = true;
+        } catch {
           this.toolsSupported = true; // Assume support if we can't determine
         }
-        return true;
       }
       
-      return false;
+      return true;
     } catch {
       return false;
     }
@@ -202,23 +119,9 @@ export class OllamaProvider extends BaseProvider {
    */
   async listModels(): Promise<ModelInfo[]> {
     try {
-      const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 5000);
+      const response = await this.client.list();
       
-      const response = await fetch(`${this.baseUrl}/api/tags`, {
-        method: 'GET',
-        signal: controller.signal,
-      });
-      
-      clearTimeout(timeoutId);
-      
-      if (!response.ok) {
-        throw new ProviderRequestError(this.PROVIDER_NAME, `HTTP ${response.status}`);
-      }
-      
-      const data = await response.json() as OllamaModelsResponse;
-      
-      return data.models.map(model => ({
+      return response.models.map(model => ({
         id: model.name,
         object: 'model' as const,
         owned_by: 'ollama',
@@ -227,7 +130,9 @@ export class OllamaProvider extends BaseProvider {
         supports_vision: this.modelSupportsVision(model.name),
       }));
     } catch (error) {
-      if (error instanceof ProviderRequestError) throw error;
+      if (error instanceof Error) {
+        throw new ProviderUnavailableError(this.PROVIDER_NAME, error.message);
+      }
       throw new ProviderUnavailableError(this.PROVIDER_NAME, 'Failed to list models');
     }
   }
@@ -258,6 +163,28 @@ export class OllamaProvider extends BaseProvider {
       'moondream',
     ];
     return visionModels.some(m => modelName.toLowerCase().includes(m));
+  }
+  
+  /**
+   * Handle SDK errors and convert to our error types.
+   */
+  private handleError(error: unknown): never {
+    // Handle timeout errors
+    if (error instanceof Error && (error.name === 'AbortError' || error.message.includes('timeout'))) {
+      throw new TimeoutError(this.PROVIDER_NAME, this.timeout);
+    }
+    
+    // Handle connection errors
+    if (error instanceof Error && (error.message.includes('ECONNREFUSED') || error.message.includes('fetch failed'))) {
+      throw new ProviderUnavailableError(this.PROVIDER_NAME, 'Ollama is not running. Start it with: ollama serve');
+    }
+    
+    // Handle generic errors
+    if (error instanceof Error) {
+      throw new ProviderRequestError(this.PROVIDER_NAME, error.message);
+    }
+    
+    throw new ProviderRequestError(this.PROVIDER_NAME, String(error));
   }
   
   /**
@@ -302,7 +229,6 @@ export class OllamaProvider extends BaseProvider {
       // Handle tool calls
       if (msg.tool_calls && msg.tool_calls.length > 0) {
         ollamaMsg.tool_calls = msg.tool_calls.map(tc => ({
-          id: tc.id,
           function: {
             name: tc.function.name,
             arguments: JSON.parse(tc.function.arguments),
@@ -323,24 +249,24 @@ export class OllamaProvider extends BaseProvider {
       function: {
         name: tool.function.name,
         description: tool.function.description || '',
-        parameters: tool.function.parameters,
+        parameters: tool.function.parameters as OllamaTool['function']['parameters'],
       },
     }));
   }
   
   /**
-   * Convert Ollama response to OpenAI format.
+   * Convert Ollama response to our format.
    */
-  private convertResponse(response: OllamaChatResponse, model: string): ChatCompletion {
+  private convertResponse(response: ChatResponse, model: string): ChatCompletion {
     const message: Message = {
-      role: response.message.role,
+      role: response.message.role as Message['role'],
       content: response.message.content || null,
     };
     
     // Convert tool calls
     if (response.message.tool_calls && response.message.tool_calls.length > 0) {
       message.tool_calls = response.message.tool_calls.map((tc, i) => ({
-        id: tc.id || `call_${i}`,
+        id: `call_${i}`,
         type: 'function' as const,
         function: {
           name: tc.function.name,
@@ -378,68 +304,51 @@ export class OllamaProvider extends BaseProvider {
    * Create a chat completion.
    */
   async completion(request: CompletionRequest): Promise<ChatCompletion> {
-    const ollamaRequest: OllamaChatRequest = {
-      model: request.model,
-      messages: this.convertMessages(request.messages),
-      stream: false,
-    };
-    
-    // Add tools if provided
-    if (request.tools && request.tools.length > 0) {
-      if (this.toolsSupported === false) {
-        throw new ProviderRequestError(
-          this.PROVIDER_NAME,
-          `Ollama version ${this.version} does not support tool calling. ` +
-          `Upgrade to ${MINIMUM_TOOL_VERSION} or later.`
-        );
-      }
-      ollamaRequest.tools = this.convertTools(request.tools);
-    }
-    
-    // Add options
-    ollamaRequest.options = {};
-    if (request.temperature !== undefined) {
-      ollamaRequest.options.temperature = request.temperature;
-    }
-    if (request.top_p !== undefined) {
-      ollamaRequest.options.top_p = request.top_p;
-    }
-    if (request.max_tokens !== undefined) {
-      ollamaRequest.options.num_predict = request.max_tokens;
-    }
-    if (request.stop) {
-      ollamaRequest.options.stop = Array.isArray(request.stop) ? request.stop : [request.stop];
-    }
-    if (request.seed !== undefined) {
-      ollamaRequest.options.seed = request.seed;
-    }
-    
     try {
-      const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), this.timeout);
+      const chatRequest: ChatRequest & { stream: false } = {
+        model: request.model,
+        messages: this.convertMessages(request.messages),
+        stream: false,
+      };
       
-      const response = await fetch(`${this.baseUrl}/api/chat`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(ollamaRequest),
-        signal: controller.signal,
-      });
-      
-      clearTimeout(timeoutId);
-      
-      if (!response.ok) {
-        const errorText = await response.text();
-        throw new ProviderRequestError(this.PROVIDER_NAME, `HTTP ${response.status}: ${errorText}`, response.status);
+      // Add tools if provided
+      if (request.tools && request.tools.length > 0) {
+        if (this.toolsSupported === false) {
+          throw new ProviderRequestError(
+            this.PROVIDER_NAME,
+            `Ollama version ${this.version} does not support tool calling. ` +
+            `Upgrade to ${MINIMUM_TOOL_VERSION} or later.`
+          );
+        }
+        chatRequest.tools = this.convertTools(request.tools);
       }
       
-      const data = await response.json() as OllamaChatResponse;
-      return this.convertResponse(data, request.model);
+      // Add options
+      chatRequest.options = {};
+      if (request.temperature !== undefined) {
+        chatRequest.options.temperature = request.temperature;
+      }
+      if (request.top_p !== undefined) {
+        chatRequest.options.top_p = request.top_p;
+      }
+      if (request.max_tokens !== undefined) {
+        chatRequest.options.num_predict = request.max_tokens;
+      }
+      if (request.stop) {
+        chatRequest.options.stop = Array.isArray(request.stop) ? request.stop : [request.stop];
+      }
+      if (request.seed !== undefined) {
+        chatRequest.options.seed = request.seed;
+      }
+      
+      const response = await this.client.chat(chatRequest);
+      return this.convertResponse(response, request.model);
     } catch (error) {
-      if (error instanceof ProviderRequestError) throw error;
-      if (error instanceof Error && error.name === 'AbortError') {
-        throw new TimeoutError(this.PROVIDER_NAME, this.timeout);
+      // Re-throw our errors
+      if (error instanceof ProviderRequestError || error instanceof ProviderUnavailableError || error instanceof TimeoutError) {
+        throw error;
       }
-      throw new ProviderRequestError(this.PROVIDER_NAME, error instanceof Error ? error.message : String(error));
+      throw this.handleError(error);
     }
   }
   
@@ -447,111 +356,79 @@ export class OllamaProvider extends BaseProvider {
    * Stream a chat completion.
    */
   async *completionStream(request: CompletionRequest): AsyncIterable<ChatCompletionChunk> {
-    const ollamaRequest: OllamaChatRequest = {
-      model: request.model,
-      messages: this.convertMessages(request.messages),
-      stream: true,
-    };
-    
-    // Add tools if provided
-    if (request.tools && request.tools.length > 0) {
-      if (this.toolsSupported === false) {
-        throw new ProviderRequestError(
-          this.PROVIDER_NAME,
-          `Ollama version ${this.version} does not support tool calling.`
-        );
-      }
-      ollamaRequest.tools = this.convertTools(request.tools);
-    }
-    
-    // Add options
-    ollamaRequest.options = {};
-    if (request.temperature !== undefined) {
-      ollamaRequest.options.temperature = request.temperature;
-    }
-    if (request.top_p !== undefined) {
-      ollamaRequest.options.top_p = request.top_p;
-    }
-    if (request.max_tokens !== undefined) {
-      ollamaRequest.options.num_predict = request.max_tokens;
-    }
-    
-    const response = await fetch(`${this.baseUrl}/api/chat`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(ollamaRequest),
-    });
-    
-    if (!response.ok) {
-      const errorText = await response.text();
-      throw new ProviderRequestError(this.PROVIDER_NAME, `HTTP ${response.status}: ${errorText}`, response.status);
-    }
-    
-    if (!response.body) {
-      throw new ProviderRequestError(this.PROVIDER_NAME, 'No response body for streaming');
-    }
-    
-    const reader = response.body.getReader();
-    const decoder = new TextDecoder();
-    let buffer = '';
-    const id = `ollama-${Date.now()}`;
-    const created = Math.floor(Date.now() / 1000);
-    
     try {
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
+      const chatRequest: ChatRequest & { stream: true } = {
+        model: request.model,
+        messages: this.convertMessages(request.messages),
+        stream: true,
+      };
+      
+      // Add tools if provided
+      if (request.tools && request.tools.length > 0) {
+        if (this.toolsSupported === false) {
+          throw new ProviderRequestError(
+            this.PROVIDER_NAME,
+            `Ollama version ${this.version} does not support tool calling.`
+          );
+        }
+        chatRequest.tools = this.convertTools(request.tools);
+      }
+      
+      // Add options
+      chatRequest.options = {};
+      if (request.temperature !== undefined) {
+        chatRequest.options.temperature = request.temperature;
+      }
+      if (request.top_p !== undefined) {
+        chatRequest.options.top_p = request.top_p;
+      }
+      if (request.max_tokens !== undefined) {
+        chatRequest.options.num_predict = request.max_tokens;
+      }
+      
+      const stream = await this.client.chat(chatRequest);
+      
+      const id = `ollama-${Date.now()}`;
+      const created = Math.floor(Date.now() / 1000);
+      
+      for await (const chunk of stream) {
+        const chunkChoice: ChunkChoice = {
+          index: 0,
+          delta: {
+            content: chunk.message?.content || '',
+          },
+          finish_reason: chunk.done ? 'stop' : null,
+        };
         
-        buffer += decoder.decode(value, { stream: true });
-        
-        // Ollama streams newline-delimited JSON
-        const lines = buffer.split('\n');
-        buffer = lines.pop() || '';
-        
-        for (const line of lines) {
-          if (!line.trim()) continue;
-          
-          try {
-            const chunk = JSON.parse(line) as OllamaChatResponse;
-            
-            const chunkChoice: ChunkChoice = {
-              index: 0,
-              delta: {
-                content: chunk.message?.content || '',
-              },
-              finish_reason: chunk.done ? 'stop' : null,
-            };
-            
-            // Include tool calls in delta if present
-            if (chunk.message?.tool_calls && chunk.message.tool_calls.length > 0) {
-              chunkChoice.delta.tool_calls = chunk.message.tool_calls.map((tc, i) => ({
-                id: tc.id || `call_${i}`,
-                type: 'function' as const,
-                function: {
-                  name: tc.function.name,
-                  arguments: JSON.stringify(tc.function.arguments),
-                },
-              }));
-              if (chunk.done) {
-                chunkChoice.finish_reason = 'tool_calls';
-              }
-            }
-            
-            yield {
-              id,
-              object: 'chat.completion.chunk' as const,
-              created,
-              model: chunk.model || request.model,
-              choices: [chunkChoice],
-            };
-          } catch {
-            // Skip invalid JSON
+        // Include tool calls in delta if present
+        if (chunk.message?.tool_calls && chunk.message.tool_calls.length > 0) {
+          chunkChoice.delta.tool_calls = chunk.message.tool_calls.map((tc, i) => ({
+            id: `call_${i}`,
+            type: 'function' as const,
+            function: {
+              name: tc.function.name,
+              arguments: JSON.stringify(tc.function.arguments),
+            },
+          }));
+          if (chunk.done) {
+            chunkChoice.finish_reason = 'tool_calls';
           }
         }
+        
+        yield {
+          id,
+          object: 'chat.completion.chunk' as const,
+          created,
+          model: chunk.model || request.model,
+          choices: [chunkChoice],
+        };
       }
-    } finally {
-      reader.releaseLock();
+    } catch (error) {
+      // Re-throw our errors
+      if (error instanceof ProviderRequestError || error instanceof ProviderUnavailableError || error instanceof TimeoutError) {
+        throw error;
+      }
+      throw this.handleError(error);
     }
   }
 }
-

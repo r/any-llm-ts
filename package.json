@@ -1,7 +1,7 @@
 {
   "name": "any-llm-ts",
-  "version": "0.1.0",
-  "description": "A unified TypeScript interface for LLM providers - supports OpenAI, Anthropic, Ollama, and more",
+  "version": "0.2.0",
+  "description": "A unified TypeScript interface for LLM providers using official SDKs - supports OpenAI, Anthropic, Ollama, and more",
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
@@ -9,11 +9,12 @@
     ".": {
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js",
-      "require": "./dist/index.cjs"
+      "default": "./dist/index.js"
     },
     "./providers": {
       "types": "./dist/providers/index.d.ts",
-      "import": "./dist/providers/index.js"
+      "import": "./dist/providers/index.js",
+      "default": "./dist/providers/index.js"
     }
   },
   "files": [
@@ -38,7 +39,8 @@
     "ollama",
     "llamafile",
     "typescript",
-    "unified-api"
+    "unified-api",
+    "official-sdk"
   ],
   "author": "",
   "license": "MIT",
@@ -53,20 +55,13 @@
   "engines": {
     "node": ">=18.0.0"
   },
-  "dependencies": {},
-  "peerDependencies": {
-    "openai": "^4.0.0",
-    "@anthropic-ai/sdk": "^0.35.0"
-  },
-  "peerDependenciesMeta": {
-    "openai": {
-      "optional": true
-    },
-    "@anthropic-ai/sdk": {
-      "optional": true
-    }
+  "dependencies": {
+    "openai": "^4.77.0",
+    "@anthropic-ai/sdk": "^0.35.0",
+    "ollama": "^0.5.11"
   },
   "devDependencies": {
+    "@types/node": "^22.10.0",
     "typescript": "^5.0.0",
     "vitest": "^2.0.0"
   }

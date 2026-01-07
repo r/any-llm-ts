@@ -2,10 +2,12 @@
  * Llamafile LLM Provider for any-llm.
  * 
  * Llamafile provides an OpenAI-compatible API on localhost:8080.
+ * This provider uses the OpenAI SDK with a custom baseURL.
  * 
  * @see https://github.com/Mozilla-Ocho/llamafile
  */
 
+import OpenAI from 'openai';
 import { BaseProvider } from './base.js';
 import type {
   ChatCompletion,
@@ -20,59 +22,6 @@ import type {
 import { ProviderRequestError, ProviderUnavailableError, TimeoutError } from '../errors.js';
 
 // =============================================================================
-// OpenAI-compatible API Types (llamafile uses this format)
-// =============================================================================
-
-interface OpenAIMessage {
-  role: 'system' | 'user' | 'assistant' | 'tool';
-  content: string | null;
-  tool_calls?: Array<{
-    id: string;
-    type: 'function';
-    function: { name: string; arguments: string };
-  }>;
-  tool_call_id?: string;
-}
-
-interface OpenAIChatRequest {
-  model: string;
-  messages: OpenAIMessage[];
-  tools?: Array<{
-    type: 'function';
-    function: { name: string; description?: string; parameters: Record<string, unknown> };
-  }>;
-  max_tokens?: number;
-  temperature?: number;
-  stream?: boolean;
-}
-
-interface OpenAIChatResponse {
-  id: string;
-  object: string;
-  created: number;
-  model: string;
-  choices: Array<{
-    index: number;
-    message: OpenAIMessage;
-    finish_reason: 'stop' | 'length' | 'tool_calls' | null;
-  }>;
-  usage?: {
-    prompt_tokens: number;
-    completion_tokens: number;
-    total_tokens: number;
-  };
-}
-
-interface OpenAIModelsResponse {
-  data: Array<{
-    id: string;
-    object: string;
-    created: number;
-    owned_by: string;
-  }>;
-}
-
-// =============================================================================
 // Llamafile Provider Implementation
 // =============================================================================
 
@@ -80,7 +29,7 @@ export class LlamafileProvider extends BaseProvider {
   readonly PROVIDER_NAME = 'llamafile';
   readonly ENV_API_KEY_NAME = 'LLAMAFILE_API_KEY'; // Optional
   readonly PROVIDER_DOCUMENTATION_URL = 'https://github.com/Mozilla-Ocho/llamafile';
-  readonly API_BASE = 'http://localhost:8080';
+  readonly API_BASE = 'http://localhost:8080/v1';
   
   readonly SUPPORTS_STREAMING = true;
   readonly SUPPORTS_TOOLS = true;
@@ -88,12 +37,21 @@ export class LlamafileProvider extends BaseProvider {
   readonly SUPPORTS_LIST_MODELS = true;
   readonly SUPPORTS_REASONING = false;
   
+  private client: OpenAI;
   private timeout: number;
   
   constructor(config: ProviderConfig = {}) {
     super(config);
     this.init();
     this.timeout = config.timeout ?? 60000;
+    
+    // Initialize the OpenAI client pointed at llamafile
+    this.client = new OpenAI({
+      apiKey: this.apiKey || 'not-needed', // Llamafile doesn't require an API key
+      baseURL: this.baseUrl,
+      timeout: this.timeout,
+      maxRetries: config.maxRetries as number ?? 2,
+    });
   }
   
   /**
@@ -108,16 +66,8 @@ export class LlamafileProvider extends BaseProvider {
    */
   async isAvailable(): Promise<boolean> {
     try {
-      const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 5000);
-      
-      const response = await fetch(`${this.baseUrl}/v1/models`, {
-        method: 'GET',
-        signal: controller.signal,
-      });
-      
-      clearTimeout(timeoutId);
-      return response.ok;
+      await this.client.models.list({ timeout: 5000 });
+      return true;
     } catch {
       return false;
     }
@@ -128,23 +78,9 @@ export class LlamafileProvider extends BaseProvider {
    */
   async listModels(): Promise<ModelInfo[]> {
     try {
-      const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 5000);
+      const response = await this.client.models.list({ timeout: 5000 });
       
-      const response = await fetch(`${this.baseUrl}/v1/models`, {
-        method: 'GET',
-        signal: controller.signal,
-      });
-      
-      clearTimeout(timeoutId);
-      
-      if (!response.ok) {
-        throw new ProviderRequestError(this.PROVIDER_NAME, `HTTP ${response.status}`);
-      }
-      
-      const data = await response.json() as OpenAIModelsResponse;
-      
-      return data.data.map(model => ({
+      return response.data.map(model => ({
         id: model.id,
         object: 'model' as const,
         created: model.created,
@@ -153,63 +89,121 @@ export class LlamafileProvider extends BaseProvider {
         supports_tools: true,
       }));
     } catch (error) {
-      if (error instanceof ProviderRequestError) throw error;
+      if (error instanceof Error && (error.message.includes('ECONNREFUSED') || error.message.includes('fetch failed'))) {
+        throw new ProviderUnavailableError(this.PROVIDER_NAME, 'Llamafile is not running');
+      }
       throw new ProviderUnavailableError(this.PROVIDER_NAME, 'Failed to list models');
     }
   }
   
   /**
-   * Convert messages to OpenAI format.
+   * Handle SDK errors and convert to our error types.
    */
-  private convertMessages(messages: Message[]): OpenAIMessage[] {
+  private handleError(error: unknown): never {
+    // Handle connection errors
+    if (error instanceof Error && (error.message.includes('ECONNREFUSED') || error.message.includes('fetch failed'))) {
+      throw new ProviderUnavailableError(this.PROVIDER_NAME, 'Llamafile is not running. Start your llamafile first.');
+    }
+    
+    // Handle timeout errors
+    if (error instanceof Error && error.name === 'AbortError') {
+      throw new TimeoutError(this.PROVIDER_NAME, this.timeout);
+    }
+    
+    // Handle OpenAI SDK errors
+    if (error && typeof error === 'object' && 'status' in error) {
+      const apiError = error as { status: number; message?: string };
+      throw new ProviderRequestError(
+        this.PROVIDER_NAME,
+        apiError.message || `HTTP ${apiError.status}`,
+        apiError.status,
+      );
+    }
+    
+    // Handle generic errors
+    if (error instanceof Error) {
+      throw new ProviderRequestError(this.PROVIDER_NAME, error.message);
+    }
+    
+    throw new ProviderRequestError(this.PROVIDER_NAME, String(error));
+  }
+  
+  /**
+   * Convert our messages to OpenAI SDK format.
+   */
+  private convertMessages(messages: Message[]): OpenAI.ChatCompletionMessageParam[] {
     return messages.map(msg => {
-      const openaiMsg: OpenAIMessage = {
-        role: msg.role,
-        content: null,
-      };
+      if (msg.role === 'system') {
+        return {
+          role: 'system' as const,
+          content: typeof msg.content === 'string' ? msg.content : '',
+        };
+      }
       
+      if (msg.role === 'tool') {
+        return {
+          role: 'tool' as const,
+          content: typeof msg.content === 'string' ? msg.content : JSON.stringify(msg.content),
+          tool_call_id: msg.tool_call_id || '',
+        };
+      }
+      
+      if (msg.role === 'assistant') {
+        const assistantMsg: OpenAI.ChatCompletionAssistantMessageParam = {
+          role: 'assistant' as const,
+          content: typeof msg.content === 'string' ? msg.content : null,
+        };
+        
+        if (msg.tool_calls && msg.tool_calls.length > 0) {
+          assistantMsg.tool_calls = msg.tool_calls.map(tc => ({
+            id: tc.id,
+            type: 'function' as const,
+            function: {
+              name: tc.function.name,
+              arguments: tc.function.arguments,
+            },
+          }));
+        }
+        
+        return assistantMsg;
+      }
+      
+      // User message - flatten multimodal to text only for llamafile
+      let content = '';
       if (typeof msg.content === 'string') {
-        openaiMsg.content = msg.content;
-      } else if (msg.content === null) {
-        openaiMsg.content = null;
+        content = msg.content;
       } else if (Array.isArray(msg.content)) {
-        // Flatten multimodal to text only for llamafile
-        openaiMsg.content = msg.content
+        content = msg.content
           .filter(p => p.type === 'text')
           .map(p => (p as { text: string }).text)
           .join(' ');
       }
       
-      if (msg.tool_calls) {
-        openaiMsg.tool_calls = msg.tool_calls;
-      }
-      
-      if (msg.tool_call_id) {
-        openaiMsg.tool_call_id = msg.tool_call_id;
-      }
-      
-      return openaiMsg;
+      return {
+        role: 'user' as const,
+        content,
+      };
     });
   }
   
   /**
-   * Convert tools to OpenAI format.
+   * Convert our tools to OpenAI SDK format.
    */
-  private convertTools(tools: Tool[]): OpenAIChatRequest['tools'] {
+  private convertTools(tools: Tool[]): OpenAI.ChatCompletionTool[] {
     return tools.map(tool => ({
       type: 'function' as const,
       function: {
         name: tool.function.name,
         description: tool.function.description,
-        parameters: tool.function.parameters,
+        parameters: tool.function.parameters as Record<string, unknown>,
       },
     }));
   }
   
   /**
-   * Convert response to our format.
+   * Convert OpenAI SDK response to our format.
    */
-  private convertResponse(response: OpenAIChatResponse): ChatCompletion {
+  private convertResponse(response: OpenAI.ChatCompletion): ChatCompletion {
     return {
       id: response.id,
       object: 'chat.completion',
@@ -221,11 +215,22 @@ export class LlamafileProvider extends BaseProvider {
         message: {
           role: choice.message.role,
           content: choice.message.content,
-          tool_calls: choice.message.tool_calls,
+          tool_calls: choice.message.tool_calls?.map(tc => ({
+            id: tc.id,
+            type: 'function' as const,
+            function: {
+              name: tc.function.name,
+              arguments: tc.function.arguments,
+            },
+          })),
         },
-        finish_reason: choice.finish_reason,
+        finish_reason: choice.finish_reason as ChatCompletion['choices'][0]['finish_reason'],
       })),
-      usage: response.usage,
+      usage: response.usage ? {
+        prompt_tokens: response.usage.prompt_tokens,
+        completion_tokens: response.usage.completion_tokens,
+        total_tokens: response.usage.total_tokens,
+      } : undefined,
     };
   }
   
@@ -233,48 +238,27 @@ export class LlamafileProvider extends BaseProvider {
    * Create a chat completion.
    */
   async completion(request: CompletionRequest): Promise<ChatCompletion> {
-    const openaiRequest: OpenAIChatRequest = {
-      model: request.model || 'default',
-      messages: this.convertMessages(request.messages),
-      stream: false,
-    };
-    
-    if (request.tools && request.tools.length > 0) {
-      openaiRequest.tools = this.convertTools(request.tools);
-    }
-    if (request.max_tokens !== undefined) {
-      openaiRequest.max_tokens = request.max_tokens;
-    }
-    if (request.temperature !== undefined) {
-      openaiRequest.temperature = request.temperature;
-    }
-    
     try {
-      const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), this.timeout);
+      const params: OpenAI.ChatCompletionCreateParamsNonStreaming = {
+        model: request.model || 'default',
+        messages: this.convertMessages(request.messages),
+        stream: false,
+      };
       
-      const response = await fetch(`${this.baseUrl}/v1/chat/completions`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(openaiRequest),
-        signal: controller.signal,
-      });
-      
-      clearTimeout(timeoutId);
-      
-      if (!response.ok) {
-        const errorText = await response.text();
-        throw new ProviderRequestError(this.PROVIDER_NAME, `HTTP ${response.status}: ${errorText}`, response.status);
+      if (request.tools && request.tools.length > 0) {
+        params.tools = this.convertTools(request.tools);
+      }
+      if (request.max_tokens !== undefined) {
+        params.max_tokens = request.max_tokens;
+      }
+      if (request.temperature !== undefined) {
+        params.temperature = request.temperature;
       }
       
-      const data = await response.json() as OpenAIChatResponse;
-      return this.convertResponse(data);
+      const response = await this.client.chat.completions.create(params);
+      return this.convertResponse(response);
     } catch (error) {
-      if (error instanceof ProviderRequestError) throw error;
-      if (error instanceof Error && error.name === 'AbortError') {
-        throw new TimeoutError(this.PROVIDER_NAME, this.timeout);
-      }
-      throw new ProviderRequestError(this.PROVIDER_NAME, error instanceof Error ? error.message : String(error));
+      throw this.handleError(error);
     }
   }
   
@@ -282,96 +266,54 @@ export class LlamafileProvider extends BaseProvider {
    * Stream a chat completion.
    */
   async *completionStream(request: CompletionRequest): AsyncIterable<ChatCompletionChunk> {
-    const openaiRequest: OpenAIChatRequest = {
-      model: request.model || 'default',
-      messages: this.convertMessages(request.messages),
-      stream: true,
-    };
-    
-    if (request.tools && request.tools.length > 0) {
-      openaiRequest.tools = this.convertTools(request.tools);
-    }
-    if (request.max_tokens !== undefined) {
-      openaiRequest.max_tokens = request.max_tokens;
-    }
-    if (request.temperature !== undefined) {
-      openaiRequest.temperature = request.temperature;
-    }
-    
-    const response = await fetch(`${this.baseUrl}/v1/chat/completions`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(openaiRequest),
-    });
-    
-    if (!response.ok) {
-      const errorText = await response.text();
-      throw new ProviderRequestError(this.PROVIDER_NAME, `HTTP ${response.status}: ${errorText}`, response.status);
-    }
-    
-    if (!response.body) {
-      throw new ProviderRequestError(this.PROVIDER_NAME, 'No response body for streaming');
-    }
-    
-    const reader = response.body.getReader();
-    const decoder = new TextDecoder();
-    let buffer = '';
-    
     try {
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        
-        buffer += decoder.decode(value, { stream: true });
-        
-        const lines = buffer.split('\n');
-        buffer = lines.pop() || '';
-        
-        for (const line of lines) {
-          if (line.startsWith('data: ')) {
-            const data = line.slice(6);
-            if (data === '[DONE]') return;
-            
-            try {
-              const chunk = JSON.parse(data);
-              const delta = chunk.choices?.[0]?.delta;
-              const finishReason = chunk.choices?.[0]?.finish_reason;
-              
-              if (delta) {
-                const chunkChoice: ChunkChoice = {
-                  index: 0,
-                  delta: {
-                    role: delta.role,
-                    content: delta.content || undefined,
-                    tool_calls: delta.tool_calls?.map((tc: { id: string; function: { name: string; arguments: string } }) => ({
-                      id: tc.id,
-                      type: 'function' as const,
-                      function: {
-                        name: tc.function?.name,
-                        arguments: tc.function?.arguments,
-                      },
-                    })),
-                  },
-                  finish_reason: finishReason || null,
-                };
-                
-                yield {
-                  id: chunk.id || `llamafile-${Date.now()}`,
-                  object: 'chat.completion.chunk',
-                  created: chunk.created || Math.floor(Date.now() / 1000),
-                  model: chunk.model || request.model,
-                  choices: [chunkChoice],
-                };
-              }
-            } catch {
-              // Skip invalid JSON
-            }
-          }
-        }
+      const params: OpenAI.ChatCompletionCreateParamsStreaming = {
+        model: request.model || 'default',
+        messages: this.convertMessages(request.messages),
+        stream: true,
+      };
+      
+      if (request.tools && request.tools.length > 0) {
+        params.tools = this.convertTools(request.tools);
       }
-    } finally {
-      reader.releaseLock();
+      if (request.max_tokens !== undefined) {
+        params.max_tokens = request.max_tokens;
+      }
+      if (request.temperature !== undefined) {
+        params.temperature = request.temperature;
+      }
+      
+      const stream = await this.client.chat.completions.create(params);
+      
+      for await (const chunk of stream) {
+        const deltaToolCalls = chunk.choices[0]?.delta?.tool_calls;
+        const chunkChoice: ChunkChoice = {
+          index: chunk.choices[0]?.index || 0,
+          delta: {
+            role: chunk.choices[0]?.delta?.role as ChunkChoice['delta']['role'],
+            content: chunk.choices[0]?.delta?.content || undefined,
+            tool_calls: deltaToolCalls?.map(tc => ({
+              id: tc.id,
+              type: 'function' as const,
+              function: tc.function ? {
+                name: tc.function.name || '',
+                arguments: tc.function.arguments || '',
+              } : undefined,
+            })),
+          },
+          finish_reason: chunk.choices[0]?.finish_reason as ChunkChoice['finish_reason'],
+        };
+        
+        yield {
+          id: chunk.id || `llamafile-${Date.now()}`,
+          object: 'chat.completion.chunk',
+          created: chunk.created || Math.floor(Date.now() / 1000),
+          model: chunk.model || request.model || 'default',
+          choices: [chunkChoice],
+        };
+      }
+    } catch (error) {
+      throw this.handleError(error);
     }
   }
 }
-

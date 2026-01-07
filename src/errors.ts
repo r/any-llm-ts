@@ -2,9 +2,56 @@
  * Error types for any-llm-ts.
  * 
  * Provides structured errors following the patterns from mozilla-ai/any-llm.
+ * Now enhanced to handle errors from official provider SDKs.
  */
 
 import { AnyLLMError, AnyLLMErrorCode } from './types.js';
+
+// =============================================================================
+// SDK Error Type Guards
+// =============================================================================
+
+/**
+ * Check if an error is from the OpenAI SDK.
+ */
+export function isOpenAIError(error: unknown): error is { status: number; message: string; code?: string } {
+  return (
+    error !== null &&
+    typeof error === 'object' &&
+    'status' in error &&
+    typeof (error as Record<string, unknown>).status === 'number'
+  );
+}
+
+/**
+ * Check if an error is from the Anthropic SDK.
+ */
+export function isAnthropicError(error: unknown): error is { status: number; message: string; error?: { type: string } } {
+  return (
+    error !== null &&
+    typeof error === 'object' &&
+    'status' in error &&
+    typeof (error as Record<string, unknown>).status === 'number'
+  );
+}
+
+/**
+ * Check if an error is a connection error (Ollama, Llamafile not running).
+ */
+export function isConnectionError(error: unknown): boolean {
+  if (!(error instanceof Error)) return false;
+  const message = error.message.toLowerCase();
+  return (
+    message.includes('econnrefused') ||
+    message.includes('fetch failed') ||
+    message.includes('network') ||
+    message.includes('connection')
+  );
+}
+
+// =============================================================================
+// Error Classes
+// =============================================================================
 
 /**
  * Error thrown when an API key is missing.
@@ -118,10 +165,34 @@ export function isRateLimitError(error: unknown): error is RateLimitError {
 
 /**
  * Wrap an unknown error into an AnyLLMError.
+ * Enhanced to handle errors from official provider SDKs.
  */
 export function wrapError(error: unknown, provider: string): AnyLLMError {
   if (error instanceof AnyLLMError) {
     return error;
+  }
+  
+  // Handle SDK errors with status codes
+  if (isOpenAIError(error) || isAnthropicError(error)) {
+    const { status, message } = error;
+    
+    if (status === 429) {
+      return new RateLimitError(provider);
+    }
+    
+    if (status === 401 || status === 403) {
+      return new MissingApiKeyError(provider, `${provider.toUpperCase()}_API_KEY`);
+    }
+    
+    return new ProviderRequestError(provider, message, status);
+  }
+  
+  // Handle connection errors (local providers not running)
+  if (isConnectionError(error)) {
+    return new ProviderUnavailableError(
+      provider,
+      `Cannot connect to ${provider}. Is it running?`
+    );
   }
   
   if (error instanceof Error) {
@@ -132,11 +203,11 @@ export function wrapError(error: unknown, provider: string): AnyLLMError {
       return new RateLimitError(provider);
     }
     
-    if (message.includes('unauthorized') || message.includes('invalid api key')) {
+    if (message.includes('unauthorized') || message.includes('invalid api key') || message.includes('authentication')) {
       return new MissingApiKeyError(provider, `${provider.toUpperCase()}_API_KEY`);
     }
     
-    if (message.includes('timeout') || message.includes('timed out')) {
+    if (message.includes('timeout') || message.includes('timed out') || error.name === 'AbortError') {
       return new TimeoutError(provider, 0);
     }
     
