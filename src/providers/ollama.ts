@@ -347,6 +347,10 @@ export class OllamaProvider extends BaseProvider {
           );
         }
         chatRequest.tools = this.convertTools(request.tools);
+        console.log(`[OllamaProvider] Passing ${chatRequest.tools.length} tools to Ollama:`, 
+          chatRequest.tools.map(t => t.function.name).join(', '));
+      } else {
+        console.log('[OllamaProvider] No tools passed to Ollama');
       }
       
       // Add options
@@ -368,6 +372,18 @@ export class OllamaProvider extends BaseProvider {
       }
       
       const response = await this.client.chat(chatRequest);
+      
+      // Debug logging for tool calls - log to stderr (bridge log) as well
+      const toolCallsDebug = {
+        model: response.model,
+        hasToolCalls: !!response.message?.tool_calls?.length,
+        toolCallCount: response.message?.tool_calls?.length || 0,
+        toolNames: response.message?.tool_calls?.map(tc => tc.function.name) || [],
+        contentLength: response.message?.content?.length || 0,
+      };
+      console.log('[OllamaProvider] Response summary:', JSON.stringify(toolCallsDebug));
+      process.stderr.write(`[OllamaProvider] Response: ${JSON.stringify(toolCallsDebug)}\n`);
+      
       return this.convertResponse(response, request.model);
     } catch (error) {
       // Re-throw our errors
