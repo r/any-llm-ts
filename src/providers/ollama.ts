@@ -139,17 +139,43 @@ export class OllamaProvider extends BaseProvider {
   
   /**
    * Check if a model supports tools (heuristic).
+   * 
+   * Native tool calling in Ollama requires:
+   * - Ollama v0.3.0+ (server-side)
+   * - A model that was fine-tuned for tool calling
+   * 
+   * Models with confirmed tool calling support:
+   * - llama3.1, llama3.2, llama3.3 (8B+)
+   * - mistral-nemo, mistral-large, mixtral (NOT mistral:7b-instruct which is older)
+   * - qwen2.5
+   * - phi4
+   * - command-r, command-r-plus
+   * - granite3
    */
   private modelSupportsTools(modelName: string): boolean {
-    const toolModels = [
-      'llama3', 'llama3.1', 'llama3.2', 'llama3.3',
-      'mistral', 'mixtral',
-      'qwen', 'qwen2', 'qwen2.5',
-      'phi3', 'phi4',
-      'granite',
-      'command-r',
+    const name = modelName.toLowerCase();
+    
+    // Exclude older models that don't support tools
+    const noToolSupport = [
+      'mistral:7b-instruct',  // Old Mistral before tool support
+      'mistral:7b',           // Base mistral without instruction tuning for tools
+      'llama2',               // Llama 2 doesn't have tool support
+      'codellama',            // Code Llama doesn't have tool support
     ];
-    return toolModels.some(m => modelName.toLowerCase().includes(m));
+    if (noToolSupport.some(m => name.includes(m))) {
+      return false;
+    }
+    
+    // Models with confirmed tool calling support
+    const toolModels = [
+      'llama3.1', 'llama3.2', 'llama3.3',  // Llama 3.1+ has native tool support
+      'mistral-nemo', 'mistral-large', 'mixtral',  // Newer Mistral models
+      'qwen2.5',  // Qwen 2.5 has tool support
+      'phi4',     // Phi-4 has tool support
+      'granite3', // Granite 3 has tool support
+      'command-r', // Command R models have tool support
+    ];
+    return toolModels.some(m => name.includes(m));
   }
   
   /**
